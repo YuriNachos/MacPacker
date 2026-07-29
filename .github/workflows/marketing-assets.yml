@@ -1,0 +1,160 @@
+name: Marketing assets
+
+# Builds a Debug MacPacker, drives it with SandboxPilot's media plan (sandboxpilot.json)
+# on the self-hosted Mac mini, and uploads the recorded videos to S3.
+#
+# This workflow is dispatched against the `media/marketing-assets` branch, which is the
+# only place the schema-2 media plan lives — main keeps the schema-1 screenshot plan and
+# is never merged with this branch. `workflow_dispatch` only offers workflows that exist
+# on the default branch, so the file has to be on main too; dispatching it with
+# `--ref media/marketing-assets` runs THIS version of it, against the branch's plan:
+#
+#   gh workflow run marketing-assets.yml --ref media/marketing-assets
+#
+# Runner setup (one-time, can't be scripted — TCC grants need a human): a logged-in 2x
+# HiDPI GUI session with SandboxPilot in /Applications granted Screen Recording and
+# Accessibility. TailBeat's docs/marketing-assets-runner.md covers the same mini.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never share the GUI session with another run — capture + synthesized input need
+  # exclusive control of the screen.
+  group: self-hosted-ui
+  cancel-in-progress: false
+
+jobs:
+  assets:
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 40
+    env:
+      SP_APP: /Applications/SandboxPilot.app
+      # Reuse the release bucket (vars.S3_DISTRIBUTION_PATH = s3://macpacker-releases);
+      # media lands under <path>/media/<run_id>/.
+      S3_DEST: ${{ vars.S3_DISTRIBUTION_PATH }}/media
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # CSevenZip/vendor/7zip is a submodule the build needs; TestArchives carries
+          # the plan's {archive}.
+          submodules: recursive
+
+      - name: Build MacPacker (Debug — SandboxPilotKit only activates in Debug)
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project MacPacker.xcodeproj \
+            -scheme MacPacker \
+            -configuration Debug \
+            -derivedDataPath ./DerivedData \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO > build.log 2>&1 || { echo "::error::Build failed"; tail -120 build.log; exit 1; }
+          APP=$(find ./DerivedData/Build/Products/Debug -maxdepth 1 -name 'MacPacker.app' | head -1)
+          test -d "$APP" || { echo "::error::MacPacker.app not found"; exit 1; }
+          echo "MP_APP=$APP" >> "$GITHUB_ENV"
+
+      - name: Deploy latest SandboxPilot build
+        run: |
+          set -uo pipefail
+          # The `media-tool` release carries a non-hardened Developer-ID build — the same
+          # signature every run, so the Screen Recording + Accessibility grants persist.
+          # Cross-repo download uses the runner's own gh auth.
+          unset GH_TOKEN GITHUB_TOKEN
+          gh release download media-tool --repo LeanBytes/SandboxPilot \
+            --pattern 'SandboxPilot-media.zip' --output /tmp/sp-media.zip --clobber
+          pkill -x SandboxPilot || true; sleep 1
+          rm -rf "$SP_APP"
+          ditto -x -k /tmp/sp-media.zip "$(dirname "$SP_APP")/"
+          xattr -cr "$SP_APP" 2>/dev/null || true
+          /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$SP_APP" || true
+          echo "== identity =="; codesign -dv "$SP_APP" 2>&1 | grep -E "Identifier=|TeamIdentifier=" || true
+
+      - name: Run the media plan
+        run: |
+          set -uo pipefail
+          test -d "$SP_APP" || { echo "::error::SandboxPilot not installed at $SP_APP"; exit 1; }
+          # SandboxPilot writes its run folder to ~/Downloads/SandboxPilot (downloads
+          # entitlement, no TCC prompt) — NOT the sandbox container, which System Policy
+          # denies this non-sandboxed runner from reading.
+          SP_OUT_DIR="$HOME/Downloads/SandboxPilot"
+          # Hold display + system awake for the whole step (open returns at once, so
+          # caffeinate must be a standalone assertion or the display sleeps mid-capture
+          # and hangs ScreenCaptureKit). Killed in teardown.
+          caffeinate -dimsu &
+          echo "CAFFEINATE_PID=$!" >> "$GITHUB_ENV"
+
+          # SandboxPilot first (its 127.0.0.1:8085 listener must be up before the target's
+          # kit dials in), then MacPacker; poll for result.json. The kit connect flakes
+          # occasionally, so retry — a run counts as usable once it produced any assets.
+          RESULT=""
+          run_once() {
+            pkill -x MacPacker || true; pkill -x SandboxPilot || true; sleep 2
+            find "$SP_OUT_DIR" -type d -name 'run-*' -prune -exec rm -rf {} + 2>/dev/null || true
+            open -n -a "$SP_APP" "$GITHUB_WORKSPACE/sandboxpilot.json" --args --autorun --exit-when-done
+            for _ in $(seq 1 15); do nc -z 127.0.0.1 8085 2>/dev/null && break; sleep 1; done
+            open -n "$MP_APP" --args -DisableUpdateChecks YES
+            sleep 6; lsof -nP -iTCP:8085 2>/dev/null | grep -q ESTABLISHED && echo "kit connected" || echo "kit not connected yet"
+            RESULT=""
+            for _ in $(seq 1 90); do
+              RESULT=$(find "$SP_OUT_DIR" -path '*/run-*/result.json' 2>/dev/null | sort | tail -1 || true)
+              [ -n "$RESULT" ] && break
+              sleep 5
+            done
+            [ -n "$RESULT" ] && jq -e '(.assets | length) > 0' "$RESULT" >/dev/null 2>&1
+          }
+          ATTEMPT=1
+          until run_once; do
+            echo "::warning::attempt $ATTEMPT produced no assets ($(jq -r '.error // "no result.json"' "$RESULT" 2>/dev/null)); retrying"
+            ATTEMPT=$((ATTEMPT + 1)); [ "$ATTEMPT" -gt 3 ] && break
+          done
+          test -n "$RESULT" || { echo "::error::No result.json after $ATTEMPT attempts — SandboxPilot never finished"; exit 1; }
+          echo "== result.json (attempt $ATTEMPT) =="; cat "$RESULT"; echo
+          jq -e '(.assets | length) > 0' "$RESULT" >/dev/null || { echo "::error::Plan failed: $(jq -r '.error // "unknown"' "$RESULT")"; exit 1; }
+          echo "== step trail =="
+          grep -E "step:|video |setup: " "$(dirname "$RESULT")/progress.log" 2>/dev/null | head -60 || true
+          echo "RUN_DIR=$(dirname "$RESULT")" >> "$GITHUB_ENV"
+
+      - name: Upload assets to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: eu-central-1
+        run: |
+          set -euo pipefail
+          test -n "${S3_DEST:-}" || { echo "::error::S3_DISTRIBUTION_PATH repo variable is not set"; exit 1; }
+          # `cp --recursive` (PutObject only) rather than `sync` — the release IAM user
+          # has put/get but not s3:ListBucket, which sync requires.
+          aws s3 cp "$RUN_DIR" "${S3_DEST%/}/${GITHUB_RUN_ID}/" --recursive --exclude "*.tmp"
+          echo "Uploaded $(find "$RUN_DIR" -type f | wc -l | tr -d ' ') files to ${S3_DEST%/}/${GITHUB_RUN_ID}/"
+
+      - name: Upload assets as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: marketing-videos
+          path: ${{ env.RUN_DIR }}
+          retention-days: 30
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "== processes =="
+          pgrep -lx SandboxPilot || echo "SandboxPilot NOT running"
+          pgrep -lx MacPacker || echo "MacPacker NOT running"
+          echo "== run dirs =="
+          find "$HOME/Downloads/SandboxPilot" -type d -name 'run-*' 2>/dev/null | head
+          echo "== SandboxPilot progress.log (where the run stopped) =="
+          PLOG=$(find "$HOME/Downloads/SandboxPilot" -name progress.log 2>/dev/null | sort | tail -1 || true)
+          [ -n "$PLOG" ] && { echo "$PLOG"; cat "$PLOG"; } || echo "(no progress.log)"
+          echo "== crash reports =="
+          ls -lt "$HOME/Library/Logs/DiagnosticReports/" 2>/dev/null | grep -iE "MacPacker|SandboxPilot" | head || echo "(none)"
+
+      - name: Teardown
+        if: always()
+        run: |
+          [ -n "${CAFFEINATE_PID:-}" ] && kill "$CAFFEINATE_PID" 2>/dev/null || true
+          pkill -x MacPacker || true
+          pkill -x SandboxPilot || true
